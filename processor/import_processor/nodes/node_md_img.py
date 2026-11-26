@@ -11,8 +11,11 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 from langchain_core.output_parsers import StrOutputParser
+from minio.deleteobjects import DeleteObject
 
+from clients.minio_utils import get_minio_client
 from common.config.lm_config import lm_config
+from common.config.minio_config import minio_config
 from common.logging.logger import logger, node_log, step_log
 from lm.lm_utils import get_llm_client
 from load_prompt import load_prompt
@@ -76,7 +79,7 @@ def step_2_scan_images(md_content, md_images_dir_obj):
             logger.warning(f"{image_name}是不支持的图片格式")
             continue
         # 定义正则表达式
-        pattern = re.compile(r"\!\[.*?\]\(.*?" + re.escape(image_name) + ".*?\)")
+        pattern = re.compile(r"\!\[.*?\]\(.*?" + re.escape(image_name) + r".*?\)")
 
         # 使用正则表达式匹配图片文件
         search_match = pattern.search(md_content)
@@ -90,11 +93,13 @@ def step_2_scan_images(md_content, md_images_dir_obj):
         end = search_match.end()
         pre_context = md_content[max(0, start - 100):start]
         post_context = md_content[end:min(end + 100, len(md_content))]
-        logger.debug(f"{image_name}在md_content被引用,引用的位置:{start}:{end},截取的上文:{pre_context} , 下文:{post_context}")
+        logger.debug(
+            f"{image_name}在md_content被引用,引用的位置:{start}:{end},截取的上文:{pre_context} , 下文:{post_context}")
         image_info_list.append((image_name, image_path, (pre_context, post_context)))
         logger.info(f"所有图片的上下文信息已经识别完毕,数量为:{len(image_info_list)}")
 
     return image_info_list
+
 
 @step_log("step_3_image_summary")
 def step_3_image_summary(image_info_list, stem):
@@ -105,7 +110,7 @@ def step_3_image_summary(image_info_list, stem):
     # 循环image_info_list数据,获取每一张图片的信息
     for image_name, image_path, context in image_info_list:
         # 封装提示词
-        image_prompt_text = load_prompt("image_summary", root_folder= stem,image_content=context)
+        image_prompt_text = load_prompt("image_summary", root_folder=stem, image_content=context)
 
         image_path_obj = Path(image_path)
         image_data = base64.b64encode(image_path_obj.read_bytes()).decode("utf-8")
@@ -130,6 +135,74 @@ def step_3_image_summary(image_info_list, stem):
         logger.debug(f"完成:{image_name}的视觉识别,对应的含义:{image_summary}")
 
     return image_summary_dict
+
+
+@step_log("step_4_upload_images_get_url")
+def step_4_upload_images_get_url(image_info_list, stem):
+    image_url_dict = {}
+    # 获取操作MinIo客户端对象
+    minio_client = get_minio_client()
+
+    # 获取对应目录下的所有文件  -- list_object
+    image_list = minio_client.list_objects(
+        minio_config.bucket_name,
+        # 不能以斜杠开头
+        prefix=f"{minio_config.minio_img_dir[1:]}/{stem}/",
+        recursive=True,
+    )
+
+    # 删除所有图片 -- remove_objects
+    # 封装要删除对象
+    delete_obj_list = [DeleteObject(obj.object_name) for obj in image_list]
+    errors = minio_client.remove_objects(
+        bucket_name=minio_config.bucket_name,
+        delete_object_list=delete_obj_list
+    )
+    # remove_objects 底层是生成器, 惰性执行，所以需要遍历
+    for error in errors:
+        logger.warning(f"删除图片时出错: {error}")
+
+    # 重新上传所有文件 -- fput_object
+    for image_name, image_path, _ in image_info_list:
+        try:
+            result = minio_client.fput_object(
+                bucket_name=minio_config.bucket_name,
+                object_name=minio_config.minio_img_dir[1:] + "/" + stem + "/" + image_name,
+                file_path=image_path,
+                content_type=guess_type(image_name)[0],
+            )
+            url = f"http://{minio_config.endpoint}/{minio_config.bucket_name}{minio_config.minio_img_dir}/{stem}/{image_name}"
+            image_url_dict[image_name] = url
+            logger.debug(f"{image_name}已经完成上传,对应的地址为:{url}")
+        except:
+            logger.warning(f"{image_name}上传失败,跳过,继续下一张图片传递!!")
+
+    return image_url_dict
+
+
+@step_log("step_5_md_content_image_replace")
+def step_5_md_content_image_replace(md_content, image_summary_dict, image_url_dict):
+
+    for image_name, summary in image_summary_dict.items():
+        image_url = image_url_dict[image_name]
+
+        reg = re.compile("\!\[.*?\]\(.*? " + re.escape(image_name) + r".*?\)")
+        # 使用正则替换md文件中的内容
+        # 注意：在使用sub进行替换操作的时候，如果有/\,可能会被re识别成group的获取
+        # 解决：使用匿名函数, 将异常当成普通字符串处理
+        md_content = reg.sub(lambda _: f"![{summary}]({image_url})", md_content)
+        logger.debug(f"已经完成:{image_name}图片的替换,替换入的描述:{summary},替换的地址:{image_url}")
+
+    return md_content
+
+@step_log("step_6_backup_new_md_content")
+def step_6_backup_new_md_content(md_content_new, md_path_obj):
+    # 创建一个新的路径对象
+    md_path_obj_new = md_path_obj.with_name(f"{md_path_obj.stem}_new.md")
+
+    # 将新的md内容写到新的对象中
+    md_path_obj_new.write_text(data=md_content_new, encoding="utf-8")
+    return md_path_obj_new
 
 
 @node_log("node_md_img")
@@ -158,19 +231,30 @@ def node_md_img(state: ImportGraphState) -> ImportGraphState:
     image_info_list: list[tuple[str, str, tuple[str, str]]] = step_2_scan_images(md_content, md_images_dir_obj)
 
     # 4. 调用视觉模型 生成图片摘要
-    summary_image_dict: dict[str, str] = step_3_image_summary(image_info_list, md_path_obj.stem)
+    image_summary_dict: dict[str, str] = step_3_image_summary(image_info_list, md_path_obj.stem)
 
-    # 5. 将图片上传到minio服务器 TODO
-    # 6. 替换md_content中的图片内容 TODO
-    # 7. 将新的md文件进行磁盘存储 TODO
+    # 5. 将图片上传到minio服务器
+    image_url_dict: dict[str, str] = step_4_upload_images_get_url(image_info_list, md_path_obj.stem)
+
+    # 6. 替换md_content中的图片内容
+    md_content_new: str = step_5_md_content_image_replace(md_content, image_summary_dict, image_url_dict)
+
+    # 7. 将新的md文件进行磁盘存储
+    md_path_obj_new: Path = step_6_backup_new_md_content(md_content_new, md_path_obj)
+
+    # 更新状态信息
+    state["md_path"] = str(md_path_obj_new)
+    state["md_content"] = md_content_new
 
     # 8.添加完成状态
     add_done_task(state.get("task_id"), "node_md_img")
     return state
 
+
 if __name__ == "__main__":
     """本地测试入口：单独运行该文件时，执行MD图片处理全流程测试"""
     from utils.path_util import PROJECT_ROOT
+
     logger.info(f"本地测试 - 项目根目录：{PROJECT_ROOT}")
 
     # 测试MD文件路径（需手动将测试文件放入对应目录）
